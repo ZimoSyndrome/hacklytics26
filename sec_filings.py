@@ -82,10 +82,12 @@ class SecClient:
                 "SEC requires a descriptive User-Agent with contact info. "
                 "Pass e.g. --user-agent 'Hacklytics26 Team (your.email@domain.com)'"
             )
+        # Do NOT set a fixed Host header; requests will set the correct Host for
+        # each domain (e.g., www.sec.gov vs data.sec.gov). A fixed Host can cause
+        # 404/403 when calling data.sec.gov endpoints.
         self.headers = {
             "User-Agent": user_agent,
             "Accept-Encoding": "gzip, deflate",
-            "Host": "www.sec.gov",
         }
         self.sleep_s = sleep_s
         self.timeout_s = timeout_s
@@ -94,13 +96,23 @@ class SecClient:
     def get_json(self, url: str) -> dict:
         time.sleep(self.sleep_s)
         r = self.session.get(url, headers=self.headers, timeout=self.timeout_s)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            status = r.status_code
+            snippet = (r.text or "")[:200].replace("\n", " ")
+            raise requests.HTTPError(f"HTTP {status} for {url}. Response starts: {snippet}") from e
         return r.json()
 
     def download_file(self, url: str, out_path: Path) -> None:
         time.sleep(self.sleep_s)
         r = self.session.get(url, headers=self.headers, timeout=self.timeout_s, stream=True)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError as e:
+            status = r.status_code
+            # For binary downloads, r.text may be empty; include headers only.
+            raise requests.HTTPError(f"HTTP {status} for {url}. Headers: {dict(r.headers)}") from e
         ensure_dir(out_path.parent)
         with out_path.open("wb") as f:
             for chunk in r.iter_content(chunk_size=1024 * 256):
