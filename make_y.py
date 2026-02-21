@@ -20,11 +20,11 @@ except FileExistsError:
 #       if that company name corresponds to an incident in the fraud data
 #           encode the occurrence of that incident as a one-hot vector where the location corresponds to the quarter it occurred in
 
-folder = 'MAEC-A-Multimodal-Aligned-Earnings-Conference-Call-Dataset-for-Financial-Risk-Prediction/MAEC_Dataset'
+folder = 'data/MAEC_Dataset'
 command = 'ls %s'%folder
 all_earnings_calls = os.popen(command).readlines()
 num_samples = len(all_earnings_calls); # print(f'num_samples = {num_samples}')
-fraud_data = pd.read_csv('final_fraud_data.csv')
+fraud_data = pd.read_csv('data/final_fraud_data.csv')
 fraud_tickers = list(np.unique(fraud_data['ticker']))
 
 num_time = 16 # number of quarters we look in the future from the earnings call date
@@ -70,8 +70,10 @@ plt.savefig('times.png',bbox_inches='tight',dpi=200)
 plt.close()
 
 save_path = 'data/y.npy'
-np.save(save_path,y)
-print('saved y to %s'%save_path)
+y_df = pd.DataFrame(y)
+y_df.to_csv("data/y.csv")
+# np.save(save_path,y)
+# print('saved y to %s'%save_path)
 
 
 
