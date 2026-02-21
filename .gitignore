@@ -1,4 +1,6 @@
 data/reports/
+data/processed/*.npy
+data/processed/text_call_matrix.csv
 .sec_cache/
 venv/
 __pycache__/

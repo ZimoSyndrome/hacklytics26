@@ -1,0 +1,21 @@
+{
+  "started_at": "2026-02-21T14:23:30.756605",
+  "instances_found": 3443,
+  "text_instances_loaded": 3443,
+  "text_instances_skipped": 0,
+  "audio_instances_loaded": 3443,
+  "audio_instances_skipped": 0,
+  "text_raw_dims": 2688,
+  "audio_raw_dims": 203,
+  "normalize": false,
+  "text_output_shape": [
+    3443,
+    2688
+  ],
+  "audio_output_shape": [
+    3443,
+    203
+  ],
+  "completed_at": "2026-02-21T14:23:34.404000",
+  "elapsed_seconds": 8.1
+}
