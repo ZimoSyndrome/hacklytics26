@@ -8,7 +8,7 @@ Loads:
   - final_fraud_data.csv  (SEC AAER fraud incidents)
 
 Produces:
-  - data/processed/labels.csv        (instance_id, ticker, call_date, Y_4, Y_8, Y_16, split)
+  - data/processed/labels.csv        (instance_id, ticker, call_date, Y_4, Y_8, Y_16, Y_20, split)
   - data/processed/features.npz      (text_features, audio_features, split)
 
 Split: Temporal + company-grouped (60/20/20).
@@ -23,7 +23,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 
-K_QUARTERS = [4, 8, 16]
+K_QUARTERS = [4, 8, 16, 20]
 DAYS_PER_QUARTER = 91.25
 
 

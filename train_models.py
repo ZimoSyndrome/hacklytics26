@@ -2,17 +2,24 @@
 """
 Train LightGBM fraud classifiers using 7-stat features with late fusion.
 
+Pipeline:
+  Phase 1: Hyperparameter tuning via expanding-window temporal CV (K=16)
+           - 60 random configs × 4 folds, time-weighted AP scoring
+           - Separate tuned params per modality (text, audio, filings)
+  Phase 2: Per-horizon model training + evaluation with tuned params
+  Phase 3: Filings + 3-way conditional fusion
+
 Loads:
   - data/processed/labels.csv              (temporal company-grouped split)
   - data/processed/features.npz            (7-stat text 2688d + audio 203d)
   - data/processed/filings_call_matrix.csv (10-K/10-Q features 790d) [optional]
 
-Models trained per horizon (K=4, 8, 16):
+Models trained per horizon (K=4, 8, 16, 20):
   1. Text-only     (2688 dims)
   2. Audio-only     (203 dims)
-  3. Late fusion     (weighted average of text + audio, weight from val)
+  3. Late fusion     (bootstrap-stable weighted average of text + audio)
   4. Filings-only   (790 dims) — if filings_call_matrix.csv exists
-  5. 3-way fusion   (text + audio + filings, 2D grid search on val) — if filings exist
+  5. 3-way fusion   (bootstrap-stable conditional fusion) — if filings exist
 
 Evaluation:
   - Isotonic calibration on val
@@ -40,8 +47,315 @@ from datetime import datetime
 
 warnings.filterwarnings('ignore')
 
-K_QUARTERS = [4, 8, 16]
+K_QUARTERS = [4, 8, 16, 20]
+TUNING_K = 16  # Horizon used for hyperparameter tuning (most positives)
 
+
+# ─────────────────────────────────────────────────────────────
+#  EXPANDING-WINDOW TEMPORAL CV  +  HYPERPARAMETER TUNING
+# ─────────────────────────────────────────────────────────────
+
+def create_expanding_folds(df_train, n_folds=4, gap_days=30):
+    """Create expanding-window temporal folds within the train set.
+
+    Splits the 2,061 train calls into (n_folds+1) date-based bins of roughly
+    equal size.  Fold i trains on bins [0..i] and validates on bin [i+1].
+    A 30-day gap is enforced between the last train date and the first val date.
+
+    Company grouping: each ticker is assigned to whichever side (train or val)
+    contains the majority of its calls in that fold.  Ties → train.
+
+    Returns:
+        list of (train_indices, val_indices) tuples — indices into df_train.
+    """
+    df = df_train.copy()
+    df['call_date_dt'] = pd.to_datetime(df['call_date'])
+    df = df.sort_values('call_date_dt').reset_index(drop=True)
+
+    n_bins = n_folds + 1
+    bin_size = len(df) // n_bins
+    bins = []
+    for b in range(n_bins):
+        start = b * bin_size
+        end = (b + 1) * bin_size if b < n_bins - 1 else len(df)
+        bins.append(df.iloc[start:end].index.tolist())
+
+    folds = []
+    for fold_i in range(n_folds):
+        # Train indices = all bins up to and including fold_i
+        raw_train_idx = []
+        for b in range(fold_i + 1):
+            raw_train_idx.extend(bins[b])
+
+        # Val indices = next bin
+        raw_val_idx = bins[fold_i + 1]
+
+        # Enforce gap: remove train instances within gap_days of first val date
+        val_dates = df.loc[raw_val_idx, 'call_date_dt']
+        first_val_date = val_dates.min()
+        gap_cutoff = first_val_date - pd.Timedelta(days=gap_days)
+        raw_train_idx = [i for i in raw_train_idx
+                         if df.loc[i, 'call_date_dt'] <= gap_cutoff]
+
+        if len(raw_train_idx) == 0 or len(raw_val_idx) == 0:
+            continue
+
+        # Company grouping: assign each ticker to train or val by majority
+        train_set = set(raw_train_idx)
+        val_set = set(raw_val_idx)
+        all_idx = raw_train_idx + raw_val_idx
+        tickers_in_fold = df.loc[all_idx, 'ticker'].unique()
+
+        final_train, final_val = [], []
+        for ticker in tickers_in_fold:
+            ticker_rows = df.index[df['ticker'] == ticker].tolist()
+            ticker_in_fold = [i for i in ticker_rows if i in train_set or i in val_set]
+            n_train = sum(1 for i in ticker_in_fold if i in train_set)
+            n_val = sum(1 for i in ticker_in_fold if i in val_set)
+            if n_train >= n_val:  # ties → train
+                final_train.extend(ticker_in_fold)
+            else:
+                final_val.extend(ticker_in_fold)
+
+        if len(final_val) > 0 and len(final_train) > 0:
+            folds.append((sorted(final_train), sorted(final_val)))
+
+    return folds
+
+
+def time_weighted_ap(fold_scores):
+    """Compute time-weighted average of per-fold AP scores.
+
+    fold_scores: list of float or None.  None entries (degenerate folds) are skipped.
+    Weights: [1, 2, 3, 4, ...] — later folds (more recent data) count more.
+    """
+    total_weight = 0.0
+    total_score = 0.0
+    for i, score in enumerate(fold_scores):
+        if score is not None:
+            w = float(i + 1)
+            total_weight += w
+            total_score += w * score
+    return total_score / total_weight if total_weight > 0 else 0.0
+
+
+def sample_random_params(rng, n_configs=60):
+    """Sample n_configs random LightGBM parameter configurations.
+
+    Returns list of dicts, each with keys:
+        num_leaves, max_depth, learning_rate, feature_fraction,
+        min_child_samples, reg_alpha, reg_lambda
+    """
+    configs = []
+    for _ in range(n_configs):
+        configs.append({
+            'num_leaves': int(np.exp(rng.uniform(np.log(7), np.log(63)))),
+            'max_depth': rng.randint(3, 9),  # [3, 8]
+            'learning_rate': float(np.exp(rng.uniform(np.log(0.01), np.log(0.2)))),
+            'feature_fraction': round(rng.uniform(0.4, 1.0), 2),
+            'min_child_samples': rng.randint(3, 31),  # [3, 30]
+            'reg_alpha': round(rng.uniform(0.0, 5.0), 3),
+            'reg_lambda': round(rng.uniform(0.0, 5.0), 3),
+        })
+    return configs
+
+
+def tune_hyperparams(X_all, y_all, df_all, train_idx, n_configs=60, n_folds=4,
+                     gap_days=30, seed=42):
+    """Tune LightGBM hyperparameters using expanding-window temporal CV.
+
+    Only operates on the TRAIN split.  Uses time-weighted AP as the selection
+    criterion, tuning at K=16 (the horizon with the most positives).
+
+    Args:
+        X_all:      full feature matrix (all 3,443 instances)
+        y_all:      full label vector for the tuning horizon
+        df_all:     full dataframe (labels.csv)
+        train_idx:  indices into X_all / y_all for the train split
+        n_configs:  number of random hyperparameter configurations to try
+        n_folds:    number of expanding-window folds
+        gap_days:   temporal gap (days) between train and val in each fold
+        seed:       random seed for reproducibility
+
+    Returns:
+        best_params: dict of optimal LightGBM hyperparameters
+    """
+    rng = np.random.RandomState(seed)
+    df_train = df_all.iloc[train_idx].reset_index(drop=True)
+    X_train = X_all[train_idx]
+    y_train = y_all[train_idx]
+
+    # Create expanding-window folds (indices into df_train / X_train / y_train)
+    folds = create_expanding_folds(df_train, n_folds=n_folds, gap_days=gap_days)
+    print(f"  Created {len(folds)} expanding-window folds")
+    for fi, (tr, va) in enumerate(folds):
+        n_pos_tr = int(y_train[tr].sum())
+        n_pos_va = int(y_train[va].sum())
+        print(f"    Fold {fi+1}: train={len(tr)} ({n_pos_tr} pos) | val={len(va)} ({n_pos_va} pos)")
+
+    configs = sample_random_params(rng, n_configs)
+    best_score = -1.0
+    best_params = None
+
+    for ci, cfg in enumerate(configs):
+        fold_scores = []
+        for tr_idx, va_idx in folds:
+            X_tr_f, y_tr_f = X_train[tr_idx], y_train[tr_idx]
+            X_va_f, y_va_f = X_train[va_idx], y_train[va_idx]
+
+            if len(np.unique(y_tr_f)) < 2 or len(np.unique(y_va_f)) < 2:
+                fold_scores.append(None)
+                continue
+
+            try:
+                pos_ratio = sum(y_tr_f == 0) / max(1, sum(y_tr_f == 1))
+                params = {
+                    'objective': 'binary',
+                    'metric': 'average_precision',
+                    'boosting_type': 'gbdt',
+                    'verbose': -1,
+                    'n_jobs': 1,
+                    'feature_pre_filter': False,
+                    'scale_pos_weight': min(50.0, pos_ratio / 2),
+                    **cfg,
+                }
+
+                lgb_tr = lgb.Dataset(X_tr_f, y_tr_f, free_raw_data=False,
+                                     params=params)
+                lgb_va = lgb.Dataset(X_va_f, y_va_f, reference=lgb_tr,
+                                     free_raw_data=False)
+
+                model = lgb.train(
+                    params, lgb_tr,
+                    num_boost_round=300,
+                    valid_sets=[lgb_va],
+                    callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+                )
+                preds = model.predict(X_va_f, num_iteration=model.best_iteration)
+                ap = average_precision_score(y_va_f, preds)
+                fold_scores.append(ap)
+            except Exception:
+                fold_scores.append(None)
+
+        tw_score = time_weighted_ap(fold_scores)
+        if tw_score > best_score:
+            best_score = tw_score
+            best_params = cfg.copy()
+
+        if (ci + 1) % 10 == 0:
+            print(f"  [{ci+1}/{n_configs}] best time-weighted AP so far: {best_score:.4f}")
+
+    print(f"  ✓ Best config (tw-AP={best_score:.4f}): {best_params}")
+
+    # Return as full LightGBM params (add fixed params back)
+    full_params = {
+        'objective': 'binary',
+        'metric': 'average_precision',
+        'boosting_type': 'gbdt',
+        'verbose': -1,
+        'n_jobs': 1,
+        'feature_pre_filter': False,
+        **best_params,
+    }
+    return full_params
+
+
+# ─────────────────────────────────────────────────────────────
+#  BOOTSTRAP-STABLE FUSION WEIGHT SELECTION
+# ─────────────────────────────────────────────────────────────
+
+def bootstrap_fusion_weights_2way(p_text, p_audio, y_val,
+                                  n_boot=100, step=0.05, seed=42):
+    """Find stable 2-way fusion weight using bootstrap on val set.
+
+    For each bootstrap resample of val, find best weight w by grid search.
+    Returns the MEDIAN of bootstrap-optimal weights → more robust than
+    a single point estimate on the small val set.
+    """
+    rng = np.random.RandomState(seed)
+    best_weights = []
+
+    for _ in range(n_boot):
+        idx = rng.choice(len(y_val), size=len(y_val), replace=True)
+        y_b = y_val[idx]
+        if len(np.unique(y_b)) < 2:
+            continue
+
+        best_w, best_ap = 0.5, -1.0
+        for w in np.arange(0.0, 1.01, step):
+            p_fused = w * p_text[idx] + (1 - w) * p_audio[idx]
+            ap = average_precision_score(y_b, p_fused)
+            if ap > best_ap:
+                best_w, best_ap = w, ap
+        best_weights.append(best_w)
+
+    if not best_weights:
+        return 0.5
+    return float(np.median(best_weights))
+
+
+def bootstrap_fusion_weights_3way(p_text, p_audio, p_filings, y_val,
+                                  has_filing_val, n_boot=100, step=0.05,
+                                  seed=42):
+    """Bootstrap-stable 3-way fusion weights.
+
+    Searches over 231 triplets (step=0.05) on filing-covered val instances.
+    100 bootstrap resamples → component-wise median → renormalise to sum to 1.
+
+    Returns:
+        (w_text, w_audio, w_filings, median_ap)
+    """
+    covered = has_filing_val
+    covered_indices = np.where(covered)[0]
+    if covered.sum() < 5 or len(np.unique(y_val[covered])) < 2:
+        return 1 / 3, 1 / 3, 1 / 3, 0.0
+
+    rng = np.random.RandomState(seed)
+    n_steps = int(1.0 / step) + 1  # 21 for step=0.05
+    boot_weights = []
+    boot_aps = []
+
+    for _ in range(n_boot):
+        idx = rng.choice(covered_indices, size=len(covered_indices), replace=True)
+        y_b = y_val[idx]
+        if len(np.unique(y_b)) < 2:
+            continue
+
+        best_ap, best_w = -1.0, (1 / 3, 1 / 3, 1 / 3)
+        for i in range(n_steps):
+            w_t = round(i * step, 4)
+            for j in range(n_steps - i):
+                w_a = round(j * step, 4)
+                w_f = round(1.0 - w_t - w_a, 4)
+                if w_f < -1e-9:
+                    continue
+                w_f = max(0.0, w_f)
+                p_fused = w_t * p_text[idx] + w_a * p_audio[idx] + w_f * p_filings[idx]
+                ap = average_precision_score(y_b, p_fused)
+                if ap > best_ap:
+                    best_ap = ap
+                    best_w = (w_t, w_a, w_f)
+        boot_weights.append(best_w)
+        boot_aps.append(best_ap)
+
+    if not boot_weights:
+        return 1 / 3, 1 / 3, 1 / 3, 0.0
+
+    # Component-wise median, then renormalise
+    w_t = float(np.median([w[0] for w in boot_weights]))
+    w_a = float(np.median([w[1] for w in boot_weights]))
+    w_f = float(np.median([w[2] for w in boot_weights]))
+    total = w_t + w_a + w_f
+    if total <= 0:
+        return 1 / 3, 1 / 3, 1 / 3, 0.0
+
+    median_ap = float(np.median(boot_aps))
+    return round(w_t / total, 4), round(w_a / total, 4), round(w_f / total, 4), median_ap
+
+
+# ─────────────────────────────────────────────────────────────
+#  DATA LOADING
+# ─────────────────────────────────────────────────────────────
 
 def load_data():
     """Load features and labels."""
@@ -87,61 +401,6 @@ def load_filings_features(
     n_covered = has_filing.sum()
     print(f"  Instances with >=1 filing: {n_covered}/{len(has_filing)} ({n_covered/len(has_filing)*100:.1f}%)")
     return X_filings, has_filing
-
-
-def grid_search_3way_fusion(
-    p_text: np.ndarray,
-    p_audio: np.ndarray,
-    p_filings: np.ndarray,
-    y_val: np.ndarray,
-    has_filing_val: np.ndarray,
-    n_steps: int = 11,
-) -> tuple:
-    """Grid search over (w_text, w_audio, w_filings) where weights sum to 1.
-
-    Grid step = 1/(n_steps-1) = 0.10 with n_steps=11.
-    Generates all valid (w_t, w_a, w_f) triplets with w_f = 1 - w_t - w_a >= 0.
-
-    Weight search is performed ONLY on instances that have at least one filing,
-    so the filing signal isn't diluted by zero-padded rows (Option B: conditional fusion).
-    Scores each by Average Precision on the filing-covered validation subset.
-
-    Returns:
-        (best_w_text, best_w_audio, best_w_filings, best_val_ap)
-    """
-    # Use only filing-covered val instances to find weights
-    covered_mask = has_filing_val
-    if covered_mask.sum() > 0 and len(np.unique(y_val[covered_mask])) > 1:
-        p_t_c = p_text[covered_mask]
-        p_a_c = p_audio[covered_mask]
-        p_f_c = p_filings[covered_mask]
-        y_c   = y_val[covered_mask]
-    else:
-        # Fallback: use all val instances
-        p_t_c, p_a_c, p_f_c, y_c = p_text, p_audio, p_filings, y_val
-
-    if len(np.unique(y_c)) < 2:
-        return 1 / 3, 1 / 3, 1 / 3, 0.0
-
-    step = 1.0 / (n_steps - 1)
-    best_ap = -1.0
-    best_weights = (1 / 3, 1 / 3, 1 / 3)
-
-    for i in range(n_steps):
-        w_t = round(i * step, 8)
-        for j in range(n_steps - i):
-            w_a = round(j * step, 8)
-            w_f = round(1.0 - w_t - w_a, 8)
-            if w_f < -1e-9:
-                continue
-            w_f = max(0.0, w_f)
-            p_fused = w_t * p_t_c + w_a * p_a_c + w_f * p_f_c
-            ap = average_precision_score(y_c, p_fused)
-            if ap > best_ap:
-                best_ap = ap
-                best_weights = (w_t, w_a, w_f)
-
-    return (*best_weights, best_ap)
 
 
 def apply_conditional_fusion(
@@ -239,8 +498,10 @@ def train_single_modality(X_tr, y_train, X_v, y_val, base_params):
     current_params = base_params.copy()
     current_params['scale_pos_weight'] = min(50.0, pos_ratio / 2)
 
-    lgb_train = lgb.Dataset(X_tr, y_train, free_raw_data=False).construct()
-    lgb_val = lgb.Dataset(X_v, y_val, reference=lgb_train, free_raw_data=False).construct()
+    lgb_train = lgb.Dataset(X_tr, y_train, free_raw_data=False,
+                            params=current_params)
+    lgb_val = lgb.Dataset(X_v, y_val, reference=lgb_train,
+                          free_raw_data=False)
 
     model = lgb.train(
         current_params,
@@ -295,18 +556,6 @@ def main():
     val_idx = np.where(splits == 'val')[0]
     test_idx = np.where(splits == 'test')[0]
 
-    base_params = {
-        'objective': 'binary',
-        'metric': 'average_precision',
-        'boosting_type': 'gbdt',
-        'learning_rate': 0.05,
-        'num_leaves': 15,
-        'max_depth': 4,
-        'feature_fraction': 0.8,
-        'verbose': -1,
-        'n_jobs': 1,
-    }
-
     # Load feature names for importance analysis
     text_df = pd.read_csv('data/processed/text_call_matrix.csv', nrows=0)
     audio_df = pd.read_csv('data/processed/audio_call_matrix.csv', nrows=0)
@@ -347,6 +596,47 @@ def main():
     print("=" * 70)
     print(f"Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
 
+    # =========================================================
+    # PHASE 1: HYPERPARAMETER TUNING (expanding-window CV, K=16)
+    # =========================================================
+    tuning_target = f'Y_{TUNING_K}'
+    y_tuning = df[tuning_target].values
+
+    print(f"\n{'='*70}")
+    print(f"PHASE 1: HYPERPARAMETER TUNING  (K={TUNING_K}, 60 configs × 4 folds)")
+    print(f"{'='*70}")
+
+    tuned_params = {}
+    for mod_name, mod_key in [('text', 'text'), ('audio', 'audio')]:
+        print(f"\n--- Tuning {mod_name.upper()} ---")
+        tuned_params[mod_key] = tune_hyperparams(
+            X[mod_key], y_tuning, df, train_idx,
+            n_configs=60, n_folds=4, gap_days=30, seed=42,
+        )
+
+    if X_filings is not None:
+        print(f"\n--- Tuning FILINGS ---")
+        tuned_params['filings'] = tune_hyperparams(
+            X_filings, y_tuning, df, train_idx,
+            n_configs=60, n_folds=4, gap_days=30, seed=42,
+        )
+
+    results_log['tuned_hyperparams'] = {
+        k: {p: v for p, v in params.items() if p not in ('objective', 'metric', 'boosting_type', 'verbose', 'n_jobs')}
+        for k, params in tuned_params.items()
+    }
+    results_log['tuning_method'] = 'expanding_window_4fold_time_weighted'
+    results_log['tuning_horizon'] = TUNING_K
+    results_log['tuning_configs_evaluated'] = 60
+    results_log['fusion_method'] = 'bootstrap_stability_100_resamples'
+
+    # =========================================================
+    # PHASE 2: PER-K MODEL TRAINING + EVALUATION
+    # =========================================================
+    print(f"\n{'='*70}")
+    print("PHASE 2: MODEL TRAINING + EVALUATION")
+    print(f"{'='*70}")
+
     # Store per-K calibrated test predictions for 3-way fusion
     stored_preds: dict = {}  # k -> {'text_val', 'audio_val', 'text_test', 'audio_test'}
 
@@ -376,7 +666,7 @@ def main():
         X_text_tt = X['text'][test_idx]
 
         text_model, text_cal, text_val_preds = train_single_modality(
-            X_text_tr, y_train, X_text_v, y_val, base_params
+            X_text_tr, y_train, X_text_v, y_val, tuned_params['text']
         )
 
         fallback = sum(y_val == 1) / len(y_val)
@@ -416,7 +706,7 @@ def main():
         X_audio_tt = X['audio'][test_idx]
 
         audio_model, audio_cal, audio_val_preds = train_single_modality(
-            X_audio_tr, y_train, X_audio_v, y_val, base_params
+            X_audio_tr, y_train, X_audio_v, y_val, tuned_params['audio']
         )
 
         audio_thresh, _ = find_best_threshold(y_val, audio_val_preds, fallback)
@@ -454,16 +744,16 @@ def main():
         print(f"MODALITY: LATE FUSION  |  HORIZON: K={k} Quarters")
         print(f"{'='*60}")
 
-        # Find optimal fusion weight on val set
-        best_w, best_ap = 0.5, 0.0
-        for w in np.arange(0.0, 1.01, 0.05):
-            p_fused = w * text_val_preds + (1 - w) * audio_val_preds
-            if len(np.unique(y_val)) > 1:
-                ap = average_precision_score(y_val, p_fused)
-                if ap > best_ap:
-                    best_w, best_ap = w, ap
+        # Bootstrap-stable fusion weight search on val set
+        best_w = bootstrap_fusion_weights_2way(
+            text_val_preds, audio_val_preds, y_val,
+            n_boot=100, step=0.05, seed=42,
+        )
+        # Compute val AP at the selected weight
+        p_fused_val = best_w * text_val_preds + (1 - best_w) * audio_val_preds
+        best_ap = average_precision_score(y_val, p_fused_val) if len(np.unique(y_val)) > 1 else 0.0
 
-        print(f"Optimal fusion weight: {best_w:.2f} text + {1-best_w:.2f} audio (val AP={best_ap:.4f})")
+        print(f"Bootstrap-stable fusion weight: {best_w:.2f} text + {1-best_w:.2f} audio (val AP={best_ap:.4f})")
 
         # Apply fusion to test
         fused_test_preds = best_w * text_test_preds + (1 - best_w) * audio_test_preds
@@ -522,7 +812,7 @@ def main():
             X_fil_tt = X_filings[test_idx]
 
             fil_model, fil_cal, fil_val_preds = train_single_modality(
-                X_fil_tr, y_train, X_fil_v, y_val, base_params
+                X_fil_tr, y_train, X_fil_v, y_val, tuned_params['filings']
             )
 
             fil_thresh, _ = find_best_threshold(y_val, fil_val_preds, fallback)
@@ -566,12 +856,13 @@ def main():
             print(f"Val coverage: {n_val_covered}/{len(val_idx)} have filings | "
                   f"Test coverage: {n_test_covered}/{len(test_idx)} have filings")
 
-            # Weight search restricted to filing-covered val instances
-            w_t, w_a, w_f, val_ap = grid_search_3way_fusion(
-                p_text_val, p_audio_val, fil_val_preds, y_val, has_filing_val_mask
+            # Bootstrap-stable 3-way weight search (filing-covered val instances)
+            w_t, w_a, w_f, val_ap = bootstrap_fusion_weights_3way(
+                p_text_val, p_audio_val, fil_val_preds, y_val,
+                has_filing_val_mask, n_boot=100, step=0.05, seed=42,
             )
-            print(f"Optimal weights (on covered val): {w_t:.2f} text + {w_a:.2f} audio + "
-                  f"{w_f:.2f} filings (val AP={val_ap:.4f})")
+            print(f"Bootstrap-stable weights (on covered val): {w_t:.2f} text + {w_a:.2f} audio + "
+                  f"{w_f:.2f} filings (median AP={val_ap:.4f})")
 
             # Conditional fusion: renormalise to 2-way for instances without filings
             fused3_test = apply_conditional_fusion(
