@@ -1,0 +1,8 @@
+flask
+flask-cors
+lightgbm
+numpy
+scikit-learn
+joblib
+sentence-transformers
+pdfplumber
