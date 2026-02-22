@@ -3,13 +3,16 @@
 Train LightGBM fraud classifiers using 7-stat features with late fusion.
 
 Loads:
-  - data/processed/labels.csv       (temporal company-grouped split)
-  - data/processed/features.npz     (7-stat text 2688d + audio 203d)
+  - data/processed/labels.csv              (temporal company-grouped split)
+  - data/processed/features.npz            (7-stat text 2688d + audio 203d)
+  - data/processed/filings_call_matrix.csv (10-K/10-Q features 790d) [optional]
 
 Models trained per horizon (K=4, 8, 16):
-  1. Text-only   (2688 dims)
-  2. Audio-only   (203 dims)
-  3. Late fusion   (weighted average of text + audio probabilities, weight from val)
+  1. Text-only     (2688 dims)
+  2. Audio-only     (203 dims)
+  3. Late fusion     (weighted average of text + audio, weight from val)
+  4. Filings-only   (790 dims) — if filings_call_matrix.csv exists
+  5. 3-way fusion   (text + audio + filings, 2D grid search on val) — if filings exist
 
 Evaluation:
   - Isotonic calibration on val
@@ -50,6 +53,122 @@ def load_data():
 
     X = {'text': text, 'audio': audio}
     return df, X
+
+
+def load_filings_features(
+    path: Path,
+    instance_order: list,
+) -> tuple:
+    """Load filings_call_matrix.csv and return the feature matrix + coverage mask.
+
+    Verifies that the instance_id column matches instance_order exactly.
+
+    Returns:
+        X_filings: np.ndarray shape (N, 790) — feature columns (has_10k, has_10q, embeddings, lexical)
+        has_filing: np.ndarray shape (N,) bool — True if instance has at least one filing
+    """
+    df_fil = pd.read_csv(path)
+    fil_ids = df_fil['instance_id'].tolist()
+
+    if fil_ids != instance_order:
+        mismatches = [(i, a, b) for i, (a, b) in enumerate(zip(fil_ids, instance_order)) if a != b]
+        raise ValueError(
+            f"filings_call_matrix.csv row order does not match labels.csv. "
+            f"First mismatch at index {mismatches[0][0]}: '{mismatches[0][1]}' vs '{mismatches[0][2]}'"
+        )
+
+    # Coverage mask: has at least one filing
+    has_filing = ((df_fil['has_10k'] == 1) | (df_fil['has_10q'] == 1)).values
+
+    # Feature columns start after instance_id, ticker, call_date
+    feat_cols = [c for c in df_fil.columns if c not in ('instance_id', 'ticker', 'call_date')]
+    X_filings = df_fil[feat_cols].values.astype(np.float64)
+    print(f"  Filings features shape: {X_filings.shape}")
+    n_covered = has_filing.sum()
+    print(f"  Instances with >=1 filing: {n_covered}/{len(has_filing)} ({n_covered/len(has_filing)*100:.1f}%)")
+    return X_filings, has_filing
+
+
+def grid_search_3way_fusion(
+    p_text: np.ndarray,
+    p_audio: np.ndarray,
+    p_filings: np.ndarray,
+    y_val: np.ndarray,
+    has_filing_val: np.ndarray,
+    n_steps: int = 11,
+) -> tuple:
+    """Grid search over (w_text, w_audio, w_filings) where weights sum to 1.
+
+    Grid step = 1/(n_steps-1) = 0.10 with n_steps=11.
+    Generates all valid (w_t, w_a, w_f) triplets with w_f = 1 - w_t - w_a >= 0.
+
+    Weight search is performed ONLY on instances that have at least one filing,
+    so the filing signal isn't diluted by zero-padded rows (Option B: conditional fusion).
+    Scores each by Average Precision on the filing-covered validation subset.
+
+    Returns:
+        (best_w_text, best_w_audio, best_w_filings, best_val_ap)
+    """
+    # Use only filing-covered val instances to find weights
+    covered_mask = has_filing_val
+    if covered_mask.sum() > 0 and len(np.unique(y_val[covered_mask])) > 1:
+        p_t_c = p_text[covered_mask]
+        p_a_c = p_audio[covered_mask]
+        p_f_c = p_filings[covered_mask]
+        y_c   = y_val[covered_mask]
+    else:
+        # Fallback: use all val instances
+        p_t_c, p_a_c, p_f_c, y_c = p_text, p_audio, p_filings, y_val
+
+    if len(np.unique(y_c)) < 2:
+        return 1 / 3, 1 / 3, 1 / 3, 0.0
+
+    step = 1.0 / (n_steps - 1)
+    best_ap = -1.0
+    best_weights = (1 / 3, 1 / 3, 1 / 3)
+
+    for i in range(n_steps):
+        w_t = round(i * step, 8)
+        for j in range(n_steps - i):
+            w_a = round(j * step, 8)
+            w_f = round(1.0 - w_t - w_a, 8)
+            if w_f < -1e-9:
+                continue
+            w_f = max(0.0, w_f)
+            p_fused = w_t * p_t_c + w_a * p_a_c + w_f * p_f_c
+            ap = average_precision_score(y_c, p_fused)
+            if ap > best_ap:
+                best_ap = ap
+                best_weights = (w_t, w_a, w_f)
+
+    return (*best_weights, best_ap)
+
+
+def apply_conditional_fusion(
+    p_text: np.ndarray,
+    p_audio: np.ndarray,
+    p_filings: np.ndarray,
+    has_filing: np.ndarray,
+    w_t: float,
+    w_a: float,
+    w_f: float,
+) -> np.ndarray:
+    """Apply 3-way fusion with conditional fallback for missing-filing instances.
+
+    For instances WITH filings: p = w_t*p_text + w_a*p_audio + w_f*p_filings
+    For instances WITHOUT filings: p = (w_t/(w_t+w_a))*p_text + (w_a/(w_t+w_a))*p_audio
+    This avoids injecting noise from the filings model's zero-feature predictions
+    into the ensemble score for instances that have no filing data.
+    """
+    p_fused = np.empty(len(p_text))
+    # Instances with filings: full 3-way blend
+    mask = has_filing
+    p_fused[mask] = w_t * p_text[mask] + w_a * p_audio[mask] + w_f * p_filings[mask]
+    # Instances without filings: renormalised 2-way blend
+    no_mask = ~mask
+    denom = w_t + w_a if (w_t + w_a) > 0 else 1.0
+    p_fused[no_mask] = (w_t / denom) * p_text[no_mask] + (w_a / denom) * p_audio[no_mask]
+    return p_fused
 
 
 def cluster_bootstrap_pr_auc(y_true, y_prob, tickers, n_iterations=300):
@@ -194,19 +313,42 @@ def main():
     text_feature_names = list(text_df.columns[3:])
     audio_feature_names = list(audio_df.columns[3:])
 
+    # Optionally load filings features if the matrix exists
+    filings_path = Path('data/processed/filings_call_matrix.csv')
+    X_filings = None
+    has_filing_mask = None   # bool array (N,): True if instance has >=1 filing
+    filings_feature_names: list = []
+    if filings_path.exists():
+        print(f"[INFO] Loading filings features from {filings_path}")
+        instance_order = df['instance_id'].tolist()
+        X_filings, has_filing_mask = load_filings_features(filings_path, instance_order)
+        # Column names: skip instance_id, ticker, call_date
+        fil_df_header = pd.read_csv(filings_path, nrows=0)
+        filings_feature_names = [
+            c for c in fil_df_header.columns
+            if c not in ('instance_id', 'ticker', 'call_date')
+        ]
+        X['filings'] = X_filings
+    else:
+        print(f"[INFO] {filings_path} not found — skipping filings modality.")
+
     results_log = {
         'started_at': datetime.now().isoformat(),
         'features': '7-stat (mean, std, max, min, first, last, slope)',
         'split': 'temporal_company_grouped',
         'text_dims': len(text_feature_names),
         'audio_dims': len(audio_feature_names),
+        'filings_dims': len(filings_feature_names) if filings_feature_names else 0,
         'results': [],
     }
 
     print("=" * 70)
-    print("LIGHTGBM V2 — 7-STAT FEATURES + TEMPORAL COMPANY-GROUPED SPLIT")
+    print("LIGHTGBM — 7-STAT FEATURES + TEMPORAL COMPANY-GROUPED SPLIT")
     print("=" * 70)
     print(f"Train: {len(train_idx)} | Val: {len(val_idx)} | Test: {len(test_idx)}")
+
+    # Store per-K calibrated test predictions for 3-way fusion
+    stored_preds: dict = {}  # k -> {'text_val', 'audio_val', 'text_test', 'audio_test'}
 
     for k in K_QUARTERS:
         target_col = f'Y_{k}'
@@ -299,6 +441,14 @@ def main():
             'top_features': top_audio_feats[:10],
         })
 
+        # Store calibrated predictions for this horizon (used later for 3-way fusion)
+        stored_preds[k] = {
+            'text_val': text_val_preds,
+            'audio_val': audio_val_preds,
+            'text_test': text_test_preds,
+            'audio_test': audio_test_preds,
+        }
+
         # ---- LATE FUSION ----
         print(f"\n{'='*60}")
         print(f"MODALITY: LATE FUSION  |  HORIZON: K={k} Quarters")
@@ -333,6 +483,124 @@ def main():
             'pr_ci': [pr_lower, pr_upper], 'f1': f1, 'threshold': fused_thresh,
             'fusion_weight_text': best_w,
         })
+
+    # =========================================================
+    # FILINGS MODALITY + 3-WAY FUSION (if matrix available)
+    # =========================================================
+    if X_filings is not None:
+        print(f"\n{'='*70}")
+        print("FILINGS MODALITY + 3-WAY LATE FUSION")
+        print(f"{'='*70}")
+        print(f"Filings dims: {X_filings.shape[1]}")
+
+        for k in K_QUARTERS:
+            target_col = f'Y_{k}'
+            y = df[target_col].values
+            y_train, y_val, y_test = y[train_idx], y[val_idx], y[test_idx]
+
+            if sum(y_train) == 0 or sum(y_test) == 0:
+                print(f"\nSkipping K={k} filings/3-way: insufficient positives.")
+                continue
+
+            if k not in stored_preds:
+                print(f"\nSkipping K={k} 3-way fusion: no stored text/audio preds.")
+                continue
+
+            fallback = sum(y_val == 1) / len(y_val)
+            test_tickers = df['ticker'].values[test_idx]
+
+            # ---- FILINGS-ONLY ----
+            print(f"\n{'='*60}")
+            print(f"MODALITY: FILINGS  |  HORIZON: K={k} Quarters")
+            print(f"{'='*60}")
+            print(f"Train: {sum(y_train==1)} Pos/{sum(y_train==0)} Neg | "
+                  f"Val: {sum(y_val==1)} Pos/{sum(y_val==0)} Neg | "
+                  f"Test: {sum(y_test==1)} Pos/{sum(y_test==0)} Neg")
+
+            X_fil_tr = X_filings[train_idx]
+            X_fil_v = X_filings[val_idx]
+            X_fil_tt = X_filings[test_idx]
+
+            fil_model, fil_cal, fil_val_preds = train_single_modality(
+                X_fil_tr, y_train, X_fil_v, y_val, base_params
+            )
+
+            fil_thresh, _ = find_best_threshold(y_val, fil_val_preds, fallback)
+
+            fil_test_raw = fil_model.predict(X_fil_tt, num_iteration=fil_model.best_iteration)
+            fil_test_preds = fil_cal.predict(fil_test_raw)
+
+            cm, acc, prec, rec, f1, pr_auc, brier = evaluate_model(y_test, fil_test_preds, fil_thresh)
+            pr_mean, pr_lower, pr_upper = cluster_bootstrap_pr_auc(y_test, fil_test_preds, test_tickers)
+            print_results(cm, acc, prec, rec, f1, pr_auc, brier, pr_lower, pr_upper, fil_thresh)
+
+            top_fil_feats = get_feature_importance(fil_model, filings_feature_names, top_n=20)
+            if top_fil_feats:
+                print(f"\nTop filings features (by gain):")
+                for fname, fval in top_fil_feats[:10]:
+                    print(f"  {fname}: {fval:.1f}")
+
+            n_test_with_filing = has_filing_mask[test_idx].sum()
+            results_log['results'].append({
+                'horizon': k, 'modality': 'filings', 'pr_auc': pr_auc,
+                'pr_ci': [pr_lower, pr_upper], 'f1': f1, 'threshold': fil_thresh,
+                'top_features': top_fil_feats[:10],
+                'test_coverage_pct': round(n_test_with_filing / len(test_idx) * 100, 1),
+            })
+
+            # ---- 3-WAY LATE FUSION (conditional) ----
+            print(f"\n{'='*60}")
+            print(f"MODALITY: 3-WAY FUSION (text+audio+filings)  |  HORIZON: K={k} Quarters")
+            print(f"{'='*60}")
+
+            p_text_val = stored_preds[k]['text_val']
+            p_audio_val = stored_preds[k]['audio_val']
+            p_text_test = stored_preds[k]['text_test']
+            p_audio_test = stored_preds[k]['audio_test']
+
+            # Coverage masks for val/test splits
+            has_filing_val_mask = has_filing_mask[val_idx]
+            has_filing_test_mask = has_filing_mask[test_idx]
+            n_val_covered = has_filing_val_mask.sum()
+            n_test_covered = has_filing_test_mask.sum()
+            print(f"Val coverage: {n_val_covered}/{len(val_idx)} have filings | "
+                  f"Test coverage: {n_test_covered}/{len(test_idx)} have filings")
+
+            # Weight search restricted to filing-covered val instances
+            w_t, w_a, w_f, val_ap = grid_search_3way_fusion(
+                p_text_val, p_audio_val, fil_val_preds, y_val, has_filing_val_mask
+            )
+            print(f"Optimal weights (on covered val): {w_t:.2f} text + {w_a:.2f} audio + "
+                  f"{w_f:.2f} filings (val AP={val_ap:.4f})")
+
+            # Conditional fusion: renormalise to 2-way for instances without filings
+            fused3_test = apply_conditional_fusion(
+                p_text_test, p_audio_test, fil_test_preds,
+                has_filing_test_mask, w_t, w_a, w_f
+            )
+
+            # Threshold search on full val (conditional fusion applied consistently)
+            fused3_val = apply_conditional_fusion(
+                p_text_val, p_audio_val, fil_val_preds,
+                has_filing_val_mask, w_t, w_a, w_f
+            )
+            fused3_thresh, _ = find_best_threshold(y_val, fused3_val, fallback)
+
+            cm, acc, prec, rec, f1, pr_auc, brier = evaluate_model(y_test, fused3_test, fused3_thresh)
+            pr_mean, pr_lower, pr_upper = cluster_bootstrap_pr_auc(y_test, fused3_test, test_tickers)
+            print_results(cm, acc, prec, rec, f1, pr_auc, brier, pr_lower, pr_upper, fused3_thresh)
+
+            results_log['results'].append({
+                'horizon': k,
+                'modality': 'text_audio_filings_fusion',
+                'pr_auc': pr_auc,
+                'pr_ci': [pr_lower, pr_upper],
+                'f1': f1,
+                'threshold': fused3_thresh,
+                'fusion_weights': {'text': w_t, 'audio': w_a, 'filings': w_f},
+                'fusion_type': 'conditional',
+                'test_coverage_pct': round(n_test_covered / len(test_idx) * 100, 1),
+            })
 
     # Save results log
     results_dir = Path('data/results')
