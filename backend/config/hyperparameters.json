@@ -1,0 +1,43 @@
+{
+  "model_version": "0.2.0",
+
+  "horizons": {
+    "k_horizons": [4, 8, 16],
+    "primary_k": 8,
+    "labels": {
+      "4":  "4Q Ahead",
+      "8":  "8Q Ahead",
+      "16": "16Q Ahead"
+    }
+  },
+
+  "modalities": ["text", "audio", "report"],
+
+  "feature_extraction": {
+    "sbert_model": "all-MiniLM-L6-v2",
+    "sbert_dim": 384,
+    "sbert_batch_size": 128,
+    "temporal_stats": ["mean", "std", "max", "min", "first", "last", "slope"],
+    "n_temporal_stats": 7,
+    "text_dim": 2688,
+    "audio_n_raw_features": 29,
+    "audio_dim": 203,
+    "report_dim": 2688,
+    "report_fusion": "elementwise_average"
+  },
+
+  "risk_thresholds": {
+    "critical":  80,
+    "high":      65,
+    "elevated":  50,
+    "moderate":  30,
+    "low":        0
+  },
+
+  "calibration": "isotonic_regression",
+
+  "late_fusion": {
+    "default_text_weight": 0.5,
+    "weight_key": "fusion_weight_text"
+  }
+}
