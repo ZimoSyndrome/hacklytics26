@@ -6,3 +6,4 @@ scikit-learn
 joblib
 sentence-transformers
 pdfplumber
+torch==2.10.0 --index-url https://download.pytorch.org/whl/cpu
