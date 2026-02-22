@@ -1,0 +1,87 @@
+Loading datasets...
+
+--- Training Horizon K=1 Quarters | Modality: TEXT ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0015 (95% CI: 0.0014 - 0.0045)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=1 Quarters | Modality: AUDIO ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0017 (95% CI: 0.0016 - 0.0067)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=1 Quarters | Modality: FUSED ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0015 (95% CI: 0.0014 - 0.0058)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=2 Quarters | Modality: TEXT ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0015 (95% CI: 0.0014 - 0.0045)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=2 Quarters | Modality: AUDIO ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0019 (95% CI: 0.0018 - 0.0060)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=2 Quarters | Modality: FUSED ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0018 (95% CI: 0.0018 - 0.0072)
+  --> Test Brier Score: 0.0014
+
+--- Training Horizon K=4 Quarters | Modality: TEXT ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0029 (95% CI: 0.0014 - 0.0074)
+  --> Test Brier Score: 0.0029
+
+--- Training Horizon K=4 Quarters | Modality: AUDIO ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0029 (95% CI: 0.0014 - 0.0073)
+  --> Test Brier Score: 0.0029
+
+--- Training Horizon K=4 Quarters | Modality: FUSED ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0029 (95% CI: 0.0014 - 0.0076)
+  --> Test Brier Score: 0.0029
+
+--- Training Horizon K=8 Quarters | Modality: TEXT ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0249 (95% CI: 0.0077 - 0.0603)
+  --> Test Brier Score: 0.0143
+
+--- Training Horizon K=8 Quarters | Modality: AUDIO ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0404 (95% CI: 0.0046 - 0.1362)
+  --> Test Brier Score: 0.0140
+
+--- Training Horizon K=8 Quarters | Modality: FUSED ---
+  [+] Datasets constructed.
+  [+] Model trained. Calibrating...
+  [+] Calibrated. Executing test...
+  --> Test PR-AUC: 0.0142 (95% CI: 0.0058 - 0.0287)
+  --> Test Brier Score: 0.0143
+
+Training and evaluation complete. Results saved to data/results/model_metrics.json
